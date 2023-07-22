@@ -8,14 +8,43 @@ import torch
 import torch.nn as nn
 from gym.spaces import Box
 from stable_baselines3 import SAC
+from stable_baselines3.common.callbacks import BaseCallback
 from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
 from stable_baselines3.common.vec_env import DummyVecEnv
+from tqdm import tqdm
 
-logging.basicConfig(
-    filename="logs.log",
-    filemode="w",
-    format="%(name)s - %(levelname)s - %(message)s",
-)
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
+console_handler = logging.StreamHandler()
+file_handler = logging.FileHandler("logs.log")
+console_handler.setLevel(logging.INFO)
+file_handler.setLevel(logging.INFO)
+format_str = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+console_format = logging.Formatter(format_str)
+file_format = logging.Formatter(format_str)
+console_handler.setFormatter(console_format)
+file_handler.setFormatter(file_format)
+logger.addHandler(console_handler)
+logger.addHandler(file_handler)
+
+
+class ProgressCallback(BaseCallback):
+    def __init__(self, total_timesteps):
+        super(ProgressCallback, self).__init__()
+        self.pbar = None
+        self.total_timesteps = total_timesteps
+    
+    def _on_training_start(self):
+        self.pbar = tqdm(total=self.total_timesteps)
+    
+    def _on_step(self):
+        self.pbar.n = self.num_timesteps
+        self.pbar.update(0)
+    
+    def _on_training_end(self):
+        self.pbar.n = self.total_timesteps
+        self.pbar.update(0)
+        self.pbar.close()
 
 
 class GymWrapper(gym.Env):
@@ -78,6 +107,7 @@ class CustomCNN(BaseFeaturesExtractor):
         return self.linear(self.cnn(observations))
 
 
+logger.info("Creating environment...")
 env = suite.make(
     "Lift",
     robots="Panda",
@@ -97,8 +127,14 @@ policy_kwargs = dict(
     features_extractor_class=CustomCNN,
     features_extractor_kwargs=dict(feature_dim=512),
 )
+
+logger.info("Creating model...")
 model = SAC("CnnPolicy", env, policy_kwargs=policy_kwargs, verbose=1)
-model.learn(total_timesteps=1e6)
+
+logger.info("Starting model learning...")
+total_timesteps = int(1e6)
+callback = ProgressCallback(total_timesteps)
+model.learn(total_timesteps=total_timesteps, callback=callback)
 
 num_iterations = 1000
 num_rollouts = 100
@@ -107,8 +143,11 @@ num_timesteps = 100
 data_dir = "saved_data"
 os.makedirs(data_dir, exist_ok=True)
 
+logger.info("Starting iterations...")
 for iteration in range(num_iterations):
+    logger.info(f"Starting iteration {iteration}...")
     for rollout_idx in range(num_rollouts):
+        logger.info(f"Starting rollout {rollout_idx}...")
         obs = env.reset()
         rollout_rewards = []
         rollout_actions = []
@@ -116,12 +155,15 @@ for iteration in range(num_iterations):
         rollout_images = []
         rollout_states = []
         for t in range(num_timesteps):
+            logger.info(f"Observation shape: {obs.shape}")
             action, _states = model.predict(obs)
+            logger.info(f"Action: {action}")
             next_obs, reward, done, info = env.step(action)
+            logger.info(f"Reward: {reward}, Done: {done}")
             rollout_rewards.append(reward)
             rollout_actions.append(action)
             rollout_discounts.append(not done)
-            rollout_images.append(obs["image"])
+            rollout_images.append(obs["agentview_image"])
             rollout_states.append(obs)
 
             obs = next_obs
