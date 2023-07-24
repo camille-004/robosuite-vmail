@@ -1,5 +1,6 @@
 import logging
 import os
+from pathlib import Path
 
 import gym
 import numpy as np
@@ -9,9 +10,9 @@ import torch.nn as nn
 from gym.spaces import Box
 from stable_baselines3 import SAC
 from stable_baselines3.common.callbacks import BaseCallback
+from stable_baselines3.common.logger import configure
 from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
 from stable_baselines3.common.vec_env import DummyVecEnv
-from tqdm import tqdm
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -28,30 +29,11 @@ logger.addHandler(console_handler)
 logger.addHandler(file_handler)
 
 
-class ProgressCallback(BaseCallback):
-    def __init__(self, total_timesteps):
-        super(ProgressCallback, self).__init__()
-        self.pbar = None
-        self.total_timesteps = total_timesteps
-    
-    def _on_training_start(self):
-        self.pbar = tqdm(total=self.total_timesteps)
-    
-    def _on_step(self):
-        self.pbar.n = self.num_timesteps
-        self.pbar.update(0)
-    
-    def _on_training_end(self):
-        self.pbar.n = self.total_timesteps
-        self.pbar.update(0)
-        self.pbar.close()
-
-
 class GymWrapper(gym.Env):
-    def __init__(self, _env, _action_space):
+    def __init__(self, _env, action_space):
         super().__init__()
         self.env = _env
-        self.action_space = _action_space
+        self.action_space = action_space
         self.observation_space = Box(
             low=0, high=255, shape=(3, 84, 84), dtype=np.uint8
         )
@@ -78,8 +60,54 @@ class GymWrapper(gym.Env):
         return self.env.seed(seed)
 
 
+class EpsilonGreedyWrapper(gym.Wrapper):
+    def __init__(
+        self,
+        env,
+        action_space,
+        start_eps=1.0,
+        end_eps=0.01,
+        decay_rate=0.001,
+        decay_steps=10000,
+    ):
+        super().__init__(env)
+        self.start_eps = start_eps
+        self.end_eps = end_eps
+        self.decay_rate = decay_rate
+        self.decay_steps = decay_steps
+        self.step_count = 0
+        self._action_space = action_space
+        self._unwrapped = env
+
+    @property
+    def action_space(self):
+        return self._action_space
+
+    @property
+    def unwrapped(self):
+        return self._unwrapped
+
+    def reset(self, **kwargs):
+        self.step_count = 0
+        return self.env.reset(**kwargs)
+
+    def step(self, action):
+        if np.random.rand() < self._current_epsilon():
+            action_space = self.action_space
+            if isinstance(self.action_space, Box):
+                action = self.action_space.sample()
+            elif isinstance(self.action_space, gym.spaces.Discrete):
+                action = self.action_space.sample()
+        return self.env.step(action)
+
+    def _current_epsilon(self):
+        return self.end_eps + (self.start_eps - self.end_eps) * np.exp(
+            -1.0 * self.step_count / self.decay_steps
+        )
+
+
 class CustomCNN(BaseFeaturesExtractor):
-    def __init__(self, observation_space, feature_dim=512):
+    def __init__(self, observation_space, feature_dim=128):
         super(CustomCNN, self).__init__(observation_space, feature_dim)
         n_input_channels = observation_space.shape[0]
         self.cnn = nn.Sequential(
@@ -115,26 +143,39 @@ env = suite.make(
     has_offscreen_renderer=True,
     ignore_done=True,
     use_camera_obs=True,
+    use_touch_obs=False,
     camera_heights=84,
     camera_widths=84,
     reward_shaping=True,
     control_freq=20,
 )
 action_space = Box(low=-1.0, high=1.0, shape=(8,), dtype=np.float32)
+env = EpsilonGreedyWrapper(
+    env,
+    action_space,
+    start_eps=1.0,
+    end_eps=0.01,
+    decay_rate=0.001,
+    decay_steps=10000,
+)
 env = DummyVecEnv([lambda: GymWrapper(env, action_space)])
 
 policy_kwargs = dict(
     features_extractor_class=CustomCNN,
-    features_extractor_kwargs=dict(feature_dim=512),
+    features_extractor_kwargs=dict(feature_dim=128),
 )
 
 logger.info("Creating model...")
-model = SAC("CnnPolicy", env, policy_kwargs=policy_kwargs, verbose=1)
+model = SAC("CnnPolicy", env, buffer_size=int(1e6), policy_kwargs=policy_kwargs, verbose=1)
 
 logger.info("Starting model learning...")
-total_timesteps = int(1e6)
-callback = ProgressCallback(total_timesteps)
-model.learn(total_timesteps=total_timesteps, callback=callback)
+total_timesteps = int(6e6)
+current_dir = Path(__file__).resolve().parent
+log_path = current_dir / "../logs"
+tmp_path = log_path / "sac_vmail"
+new_logger = configure(str(tmp_path), ["stdout", "tensorboard"])
+model.set_logger(new_logger)
+model.learn(total_timesteps=total_timesteps, log_interval=4)
 
 num_iterations = 1000
 num_rollouts = 100
@@ -143,37 +184,35 @@ num_timesteps = 100
 data_dir = "saved_data"
 os.makedirs(data_dir, exist_ok=True)
 
-logger.info("Starting iterations...")
 for iteration in range(num_iterations):
-    logger.info(f"Starting iteration {iteration}...")
     for rollout_idx in range(num_rollouts):
-        logger.info(f"Starting rollout {rollout_idx}...")
         obs = env.reset()
+        episode_reward = 0
         rollout_rewards = []
         rollout_actions = []
         rollout_discounts = []
         rollout_images = []
         rollout_states = []
         for t in range(num_timesteps):
-            logger.info(f"Observation shape: {obs.shape}")
             action, _states = model.predict(obs)
-            logger.info(f"Action: {action}")
             next_obs, reward, done, info = env.step(action)
-            logger.info(f"Reward: {reward}, Done: {done}")
+            episode_reward += reward
+
+            logger.info(
+                f"Iteration: {iteration}, Rollout: {rollout_idx}, Step: {t}, Reward: {reward[0]}"
+            )
             rollout_rewards.append(reward)
             rollout_actions.append(action)
             rollout_discounts.append(not done)
-            rollout_images.append(obs["agentview_image"])
+            rollout_images.append(obs[0])
             rollout_states.append(obs)
 
             obs = next_obs
 
             if done:
-                logging.info(
-                    f"Iteration: {iteration}, Rollout: {rollout_idx}, Step: {t}, Done: {done}"
-                )
                 break
 
+        episode_reward = sum(rollout_rewards)
         filename = os.path.join(
             data_dir, f"iteration_{iteration}_rollout_{rollout_idx}.npz"
         )
