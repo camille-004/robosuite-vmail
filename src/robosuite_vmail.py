@@ -9,12 +9,11 @@ import torch
 import torch.nn as nn
 from gym.spaces import Box
 from stable_baselines3 import SAC
-from stable_baselines3.common.callbacks import BaseCallback
-from stable_baselines3.common.logger import configure
-from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
 from stable_baselines3.common.vec_env import DummyVecEnv
 
-import robosuite  # isort:skip
+from policy import CustomCNN
+
+import robosuite as suite  # isort:skip
 
 
 class Wrapper(gym.Env):
@@ -166,13 +165,10 @@ demo_dir.mkdir(parents=True, exist_ok=True)
 callbacks = [save_episode_to_dir(demo_dir)]
 env = Wrapper(env, callbacks, log_callback=log_progress())
 env = DummyVecEnv([lambda: env])
-policy_kwargs = dict(net_arch=[64, 64])
-model = SAC(
-    "MlpPolicy",
-    env,
-    # buffer_size=int(1e6),
-    policy_kwargs=policy_kwargs,
-    verbose=1,
+policy_kwargs = dict(
+    features_extractor_class=CustomCNN,
+    features_extractor_kwargs=dict(features_dim=128),
 )
+model = SAC("CnnPolicy", env, policy_kwargs=policy_kwargs, verbose=1)
 total_timesteps = 10000
 model.learn(total_timesteps=total_timesteps, log_interval=4)
